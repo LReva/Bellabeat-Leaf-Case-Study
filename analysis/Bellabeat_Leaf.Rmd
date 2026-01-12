@@ -1,0 +1,875 @@
+---
+title: "Bellabeat Leaf Case Study — Methods & Validation Notebook"
+author: "Olena Scott"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  word_document:
+    toc: true
+    toc_depth: '2'
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+  pdf_document:
+    toc: true
+    toc_depth: '2'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(ggplot2)
+library(broom)
+
+options(scipen = 999)
+```
+# Objective and Leaf framing
+
+Bellabeat Leaf is a passive wearable designed to support wellness through consistent daily habits rather than performance tracking.
+This analysis uses wearable activity and sleep-related data to identify movement rhythms, consistency patterns, and feature adoption signals that can inform product messaging and engagement strategies.
+
+Primary questions:
+
+How do daily movement and sedentary behavior vary across weekdays vs weekends, and do patterns replicate across time windows?
+
+What are the typical hour-of-day activity rhythms, and are there consistent “dip” periods where gentle nudges could be effective?
+
+How consistent are users across a month-long observation window, and what is the adoption rate of optional behaviors (sleep logging, weight logging)?
+
+# Data sources and observation-window logic
+
+This project uses two Fitbit datasets provided in separate folders:
+
+Window A: 2016-03-12 to 2016-04-11
+
+Window B: 2016-04-12 to 2016-05-12
+
+These are treated as two separate observation windows, not as a continuous 60-day panel. Data was cleaned and modeled in BigQuery into analysis marts.
+
+Key design choices (already implemented in SQL):
+
+A dataset_window field identifies the source window.
+
+window_day_index (1–31) provides a consistent day-within-window scale.
+
+Records were bounded to day index 1–31 to remove overlap at the window boundary.
+
+Header rows ingested as data were dropped (e.g., Id/date parsing failures).
+
+Daily/hourly marts were built for Tableau to prevent join duplication and ensure consistent metrics.
+
+# Data loading 
+
+```{r echo=TRUE, paged.print=FALSE}
+users<- read_csv("user_summary.csv")
+daily <- read_csv("daily_leaf.csv")
+hourly <- read_csv("hourly_leaf.csv")
+win <- read_csv("window_comparisson.csv")
+
+glimpse(daily)
+glimpse(hourly)
+glimpse(users)
+glimpse(win)
+```
+# QA and coverage checks
+
+This section documents data health checks and coverage to ensure downstream insights are trustworthy.
+
+## Row counts and unique users (by window)
+
+```{r paged.print=TRUE}
+daily %>% count(dataset_window, name = "daily_rows")
+hourly %>% count(dataset_window, name = "hourly_rows")
+users %>% count(dataset_window, name = "user_rows")
+
+daily %>% distinct(Id, dataset_window) %>% count(dataset_window, name = "n_users_daily")
+hourly %>% distinct(Id, dataset_window) %>% count(dataset_window, name = "n_users_hourly")
+users %>% count(dataset_window, name = "n_users_summary")
+```
+**Interpretation notes:**
+The row counts and unique user counts confirm that the data has been correctly consolidated across the two observation windows and that each mart reflects the expected grain.
+
+The number of unique users is consistent across daily and summary marts, confirming that the daily activity table defines the core population for analysis.
+
+At the hourly level, row counts are substantially higher than daily counts, as expected given the finer temporal granularity. The consistency in unique user counts between the hourly and daily marts confirms that no unintended user duplication was introduced during the union or parsing process.
+
+The user summary mart contains one record per user per window, validating its role as a stable aggregation layer for consistency and adoption analysis.
+
+Overall, these checks indicate that:
+
+Both observation windows are present and clearly separated.
+
+Each mart conforms to its intended grain (daily, hourly, or user-window).
+
+No unexpected loss or inflation of users occurred during data cleaning and modeling.
+
+## Window day index bounds
+
+```{r paged.print=FALSE}
+daily %>% summarise(min=min(window_day_index), max=max(window_day_index))
+hourly %>% summarise(min=min(window_day_index), max=max(window_day_index))
+```
+
+## Adoption / missingness: sleep and weight flags
+
+```{r paged.print=FALSE}
+
+daily %>%
+  group_by(dataset_window) %>%
+  summarise(
+    pct_days_sleep = mean(has_sleep_log_for_day, na.rm=TRUE),
+    n_days_sleep = sum(has_sleep_log_for_day, na.rm=TRUE),
+    n_days_no_sleep = sum(!has_sleep_log_for_day, na.rm = TRUE),
+    pct_days_weight = mean(has_weight_log_for_day, na.rm=TRUE),
+    n_days_weight = sum(has_weight_log_for_day, na.rm=TRUE),
+    n_days_no_weight = sum(!has_weight_log_for_day, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+users %>%
+  group_by(dataset_window) %>%
+  summarise(
+    pct_users_sleep = mean(has_sleep_log, na.rm=TRUE),
+    pct_users_weight = mean(has_weight_log, na.rm=TRUE),
+    .groups = "drop"
+)
+```
+
+**Interpretation notes:**
+Sleep and weight logging show markedly different adoption patterns across the two observation windows.
+
+In the first window (2016-03-12 to 2016-04-11), no valid sleep records are present, indicating that sleep tracking data is not available for this period. Weight logging is observed, but remains limited, with weight records recorded on a small fraction of days and by a minority of users.
+
+In the second window (2016-04-12 to 2016-05-12), sleep logging becomes substantially more prevalent. Over 40% of days include sleep records, and approximately 73% of users log sleep at least once during the period. This suggests a meaningful increase in sleep feature usage and enables sleep-related analysis to be conducted reliably for this window only.
+
+Weight logging remains comparatively sparse in both periods. Fewer than 8% of days include weight records, and fewer than one quarter of users log weight in either window. This indicates that weight tracking is an optional behavior adopted by a small subset of users, rather than a core engagement feature.
+
+##  Range checks
+
+```{r}
+daily %>% summarise(
+  neg_steps = sum(total_steps < 0, na.rm=TRUE),
+  huge_steps = sum(total_steps > 50000, na.rm=TRUE),
+  sedentary_gt_day = sum(sedentary_minutes > 1440, na.rm=TRUE),
+  .groups = "drop"
+)
+```
+# Temporal Activity Patterns
+
+## Hourly Activity, Steps, and Calories
+
+This section examines intra-day activity patterns, focusing on how user behavior varies by hour of day and weekday. The goal is to identify consistent peaks and troughs in physical activity and energy expenditure.
+
+The analysis complements the Tableau Hourly Rhythm dashboards by validating high-level patterns numerically and ensuring consistency across tools.
+
+```{r message=FALSE, paged.print=TRUE}
+hourly %>% group_by(week_day, log_time) %>%
+  summarise(
+    average_steps = mean(total_steps, na.rm=TRUE),
+    average_calories = mean(calories, na.rm=TRUE),
+    average_intensity = mean(average_intensity, na.rm=TRUE),
+    .groups = "drop"
+  )
+```
+**Interpretation notes:**
+Overall, activity levels remain low during early morning hours, increase steadily through mid-morning, and peak during daytime and early evening hours. This pattern is consistent across weekdays, suggesting predictable daily routines among users.
+
+Calories burned and total intensity closely follow step patterns, indicating that step count serves as a reasonable proxy for overall activity intensity.
+
+## Weekday vs Weekend Behavior
+
+To understand behavioral differences between workdays and weekends, activity metrics were compared across these two categories.
+
+```{r}
+daily %>% group_by(is_weekend) %>%
+  summarise(
+    average_steps = mean(total_steps, na.rm=TRUE),
+    average_calories = mean(calories, na.rm=TRUE),
+    average_activity = mean(rowSums(across(c(lightly_active_minutes, fairly_active_minutes, very_active_minutes)), na.rm=TRUE), na.rm=TRUE)/60,
+    .groups = "drop"
+)
+```
+
+**Interpretation notes:**
+Activity levels are slightly higher on weekdays compared to weekends across all measured dimensions. On average, users record approximately 7,453 steps on weekdays, compared to 7,188 steps on weekends, indicating a modest reduction in movement during weekends. A similar pattern is observed for calorie expenditure, with weekday average calories burned (2,302) marginally exceeding weekend averages (2,277).
+
+Overall activity minutes follow the same trend, with users accumulating slightly more active minutes on weekdays (223 minutes) than on weekends (219 minutes). While the differences between weekdays and weekends are not substantial, the consistency across steps, calories, and activity minutes suggests that users maintain a more active routine during the workweek.
+
+These results indicate that daily structure associated with weekdays may encourage slightly higher physical activity, whereas weekends show a small but consistent decline in engagement.
+
+## Activity Distribution by Day of Week
+
+This subsection explores how activity varies across individual weekdays, providing a more granular view beyond the weekday/weekend split.
+
+```{r}
+daily %>% group_by(week_day) %>%
+  arrange(week_day) %>%
+  summarise(
+    average_steps = mean(total_steps, na.rm=TRUE),
+    average_calories = mean(calories, na.rm=TRUE),
+    average_activity = mean(rowSums(across(c(lightly_active_minutes, fairly_active_minutes, very_active_minutes)), na.rm=TRUE), na.rm=TRUE)/60
+  )
+```
+**Interpretation notes:**
+Daily activity patterns vary meaningfully across individual days of the week and help explain the earlier observation that average weekend activity is slightly lower than weekday activity overall.
+
+Sunday (1) is consistently the least active day, with the lowest average steps (~6,607), calories (~2,227), and activity level. This low level of activity on Sunday substantially pulls down the overall weekend average.
+
+In contrast, Saturday (7) is the most active day of the week, with the highest average steps (~7,752) and the highest overall activity level. This indicates that weekend behavior is not uniform: Saturday and Sunday reflect distinct activity patterns rather than a single “weekend effect.”
+
+Activity increases from Monday into Tuesday and begins to decline by Wednesday, with lower step counts and activity levels continuing through Thursday before a modest rebound on Friday, where calorie expenditure and overall activity remain elevated despite slightly lower step counts.
+
+Taken together, these results clarify why weekends appear less active when averaged as a whole: high activity on Saturday is offset by substantially lower activity on Sunday. Weekday routines, by contrast, produce more consistent activity levels across multiple consecutive days.
+
+These findings suggest that interventions targeting weekend behavior may benefit from differentiating between Saturday and Sunday, rather than treating weekends as a single behavioral category.
+
+# Activity Composition and User-Level Engagement
+## Activity Type Distribution
+
+This section explores how users distribute time across sedentary, lightly active, fairly active, and very active categories.
+
+```{r}
+daily %>% 
+  summarise(
+    average_lightly_active_minutes= mean(lightly_active_minutes, na.rm=TRUE)/60,
+    average_fairly_active_minutes = mean(fairly_active_minutes, na.rm=TRUE)/60,
+    average_very_active_minutes = mean(very_active_minutes, na.rm=TRUE)/60,
+    average_sedentary_minutes = mean(sedentary_minutes, na.rm=TRUE)/60
+  )
+```
+**Interpretation notes:**
+Light activity accounts for the majority of non-sedentary movement, with users averaging approximately 3.1 hours of lightly active time per day, while fairly active time is minimal, averaging just 0.23 hours per day. This indicates that most daily movement occurs at low intensity, with relatively little time spent in sustained moderate activity.
+
+# User-Level Activity Variability
+This section examines baseline daily activity metrics across all users, including steps, distance, calories burned, and activity. The goal is to understand typical daily behavior and variability across the population.
+
+```{r}
+user_variability <- daily %>% group_by(Id, dataset_window) %>%
+  summarise(
+    average_steps = mean(total_steps, na.rm=TRUE),
+    average_distance = mean(total_distance, na.rm=TRUE),
+    average_calories = mean(calories, na.rm=TRUE),
+    average_activity = mean(rowSums(across(c(lightly_active_minutes, fairly_active_minutes, very_active_minutes)), na.rm=TRUE), na.rm=TRUE)/60,
+    step_variability = sd(total_steps, na.rm = TRUE),
+    n_days = n(),
+    .groups = "drop"
+)
+user_variability <- user_variability %>%
+  mutate(
+    step_cv = step_variability / average_steps
+  )
+user_variability
+```
+
+**Interpretation notes:**
+User-level summaries reveal substantial heterogeneity in both activity levels and consistency across the population. Average daily steps range widely, from fewer than 1,000 steps per day among the least active users to well over 12,000 steps per day among the most active. Average daily activity time shows a similar spread, varying from less than 1 hour to almost 6 hours per day.
+
+Variability in daily steps also differs markedly across users. Some users exhibit relatively low day-to-day fluctuation, with coefficients of variation below 0.20, indicating stable and consistent activity patterns. In contrast, other users show very high variability, with coefficients of variation exceeding 1.0, meaning that their daily step counts fluctuate as much as or more than their average activity level.
+
+Notably, higher average activity does not necessarily imply greater consistency. Several users with high average step counts still display moderate to high variability, while some lower-activity users exhibit comparatively stable routines. This suggests that activity volume and activity regularity represent distinct behavioral dimensions.
+
+Overall, these results indicate that user engagement with physical activity is best characterized along two axes: how active users are on average, and how consistently they maintain that activity over time. This distinction supports the use of grouped or segmented analyses rather than per-user inspection when evaluating behavioral patterns and designing engagement strategies.
+
+# Group-Level Activity Variability
+To better understand heterogeneity in user behavior, users were grouped into activity segments based on a combination of average activity level, consistency of daily engagement, and day-to-day variability in steps. This segmentation allows patterns to be examined at a behavioral level rather than on a per-user basis, providing more actionable insight into engagement styles across the population.
+
+Segments were analyzed separately for each observation window to account for differences in data availability and feature adoption.
+
+```{r}
+window_stats <- users %>%
+  group_by(dataset_window) %>%
+  summarise(
+    med_steps = median(avg_steps, na.rm = TRUE),
+    med_var = median(step_variability, na.rm = TRUE),
+    .groups = "drop"
+  )
+users_seg_leaf <- users %>%
+  left_join(window_stats, by = "dataset_window") %>%
+  mutate(
+    segment = case_when(
+      active_days_pct < 0.50 ~ "Low engagement",
+      active_days_pct >= 0.80 & avg_steps >= med_steps & step_variability <= med_var ~ "Consistent movers",
+      active_days_pct >= 0.50 & step_variability > med_var ~ "Irregular movers",
+      TRUE ~ "Moderate engagement"
+    )
+  )
+seg_summary_leaf <- users_seg_leaf %>%
+  group_by(dataset_window, segment) %>%
+  summarise(
+    n_users = n(),
+    avg_steps = mean(avg_steps, na.rm = TRUE),
+    avg_active_days_pct = mean(active_days_pct, na.rm = TRUE),
+    avg_variability = mean(step_variability, na.rm = TRUE),
+    avg_sedentary = mean(avg_sedentary_minutes, na.rm = TRUE),
+    pct_sleep_loggers = mean(has_sleep_log, na.rm = TRUE),
+    pct_weight_loggers = mean(has_weight_log, na.rm = TRUE),
+    .groups = "drop_last"
+  ) %>%
+  mutate(pct_users = n_users/sum(n_users)) %>%
+  ungroup()%>%
+  arrange(dataset_window, desc(pct_users))
+
+seg_summary_leaf
+
+ggplot(seg_summary_leaf, aes(x = segment, y = pct_users, fill = segment)) +
+  geom_col() +
+  facet_wrap(~ dataset_window) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "User Segments by Observation Window", x = NULL, y = "% of users") +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+**Interpretation notes:**
+In the first observation window (2016-03-12 to 2016-04-11), the user population is dominated by the Low engagement segment, which accounts for the vast majority of users. These users show relatively low consistency, with activity recorded on fewer than half of available days on average. Sleep logging is entirely absent in this window, while weight logging is present for a minority of users across segments. Due to limited variation in segment composition, behavioral differentiation in this window is minimal.
+
+In the second observation window (2016-04-12 to 2016-05-12), user behavior becomes more differentiated. Irregular movers represent the largest segment, characterized by high average step counts and high consistency, but also elevated variability, indicating fluctuating daily routines. Consistent movers, though fewer in number, exhibit the highest overall engagement, with near-daily activity, relatively low variability, and the highest rates of both sleep and weight logging. Moderate engagement users show high consistency but lower overall activity levels, while Low engagement users remain rare in this period.
+
+Across segments, adoption of sleep logging is substantially higher in the second window and is most prevalent among users with higher consistency and activity levels. Weight logging remains limited overall but is more common among the most engaged users, suggesting that deeper feature adoption is associated with sustained and consistent activity behavior.
+
+# Relationship between Activity Types and Calories
+## Activity Time by Type vs Daily Calories Burned
+
+This section examines how daily calorie expenditure relates to different components of daily behavior. The goal is to identify which behavioral signals best align with energy expenditure and which associations are weak or negligible.
+
+```{r}
+cor_by_window <- daily %>%
+  filter(very_active_minutes > 0) %>%
+  group_by(dataset_window) %>%
+  summarise(
+    cor_very_active_minutes_calories = cor(very_active_minutes, calories, use = "complete.obs"),
+    n_days = n(),
+    .groups = "drop"
+  )
+
+cor_by_window
+
+lm_by_window <- daily %>%
+  group_by(dataset_window) %>%
+  do(model = lm(calories ~ very_active_minutes, data = .))
+
+print(summary(lm_by_window$model[[1]]), digits = 4)
+print(summary(lm_by_window$model[[2]]), digits = 4)
+
+ggplot(daily, aes(x = very_active_minutes, y = calories)) +
+  geom_point(alpha = 0.25, size = 1) +
+  geom_smooth(method = "lm", se = FALSE, color = "purple", linewidth = 1) +
+  facet_wrap(~ dataset_window) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Very Active Minutes vs Calories Burned",
+    subtitle = "Each point represents one user-day",
+    x = "Very Active Minutes",
+    y = "Calories Burned"
+  ) +
+  theme_minimal(base_size = 13)
+
+cor_by_window <- daily %>%
+  filter(lightly_active_minutes > 0) %>%
+  group_by(dataset_window) %>%
+  summarise(
+    cor_lightly_active_minutes_calories = cor(lightly_active_minutes, calories, use = "complete.obs"),
+    n_days = n(),
+    .groups = "drop"
+  )
+
+cor_by_window
+
+lm_by_window <- daily %>%
+  group_by(dataset_window) %>%
+  do(model = lm(calories ~ lightly_active_minutes, data = .))
+
+print(summary(lm_by_window$model[[1]]), digits = 4)
+print(summary(lm_by_window$model[[2]]), digits = 4)
+
+ggplot(daily, aes(x = lightly_active_minutes, y = calories)) +
+  geom_point(alpha = 0.25, size = 1) +
+  geom_smooth(method = "lm", se = FALSE, color = "purple", linewidth = 1) +
+  facet_wrap(~ dataset_window) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Lightly Active Minutes vs Calories Burned",
+    subtitle = "Each point represents one user-day",
+    x = "Lightly Active Minutes",
+    y = "Calories Burned"
+  ) +
+  theme_minimal(base_size = 13)
+
+cor_by_window <- daily %>%
+  filter(fairly_active_minutes > 0) %>%
+  group_by(dataset_window) %>%
+  summarise(
+    cor_fairy_active_minutes_calories = cor(fairly_active_minutes, calories, use = "complete.obs"),
+    n_days = n(),
+    .groups = "drop"
+  )
+
+cor_by_window
+
+lm_by_window <- daily %>%
+  group_by(dataset_window) %>%
+  do(model = lm(calories ~ fairly_active_minutes, data = .))
+
+print(summary(lm_by_window$model[[1]]), digits = 4)
+print(summary(lm_by_window$model[[2]]), digits = 4)
+
+ggplot(daily, aes(x = fairly_active_minutes, y = calories)) +
+  geom_point(alpha = 0.25, size = 1) +
+  geom_smooth(method = "lm", se = FALSE, color = "purple", linewidth = 1) +
+  facet_wrap(~ dataset_window) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Fairy Active Minutes vs Calories Burned",
+    subtitle = "Each point represents one user-day",
+    x = "Fairy Active Minutes",
+    y = "Calories Burned"
+  ) +
+  theme_minimal(base_size = 13)
+
+cor_by_window <- daily %>%
+  filter(sedentary_minutes > 0) %>%
+  group_by(dataset_window) %>%
+  summarise(
+    cor_sedentary_minutes_calories = cor(sedentary_minutes, calories, use = "complete.obs"),
+    n_days = n(),
+    .groups = "drop"
+  )
+
+cor_by_window
+
+lm_by_window <- daily %>%
+  group_by(dataset_window) %>%
+  do(model = lm(calories ~ sedentary_minutes, data = .))
+
+print(summary(lm_by_window$model[[1]]), digits = 4)
+print(summary(lm_by_window$model[[2]]), digits = 4)
+
+ggplot(daily, aes(x = sedentary_minutes, y = calories)) +
+  geom_point(alpha = 0.25, size = 1) +
+  geom_smooth(method = "lm", se = FALSE, color = "purple", linewidth = 1) +
+  facet_wrap(~ dataset_window) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Sedentary Minutes vs Calories Burned",
+    subtitle = "Each point represents one user-day",
+    x = "Sedentary Minutes",
+    y = "Calories Burned"
+  ) +
+  theme_minimal(base_size = 13)
+```
+**Interpretation notes:**
+Across both observation windows, calories show the strongest positive association with very active minutes (correlations ~0.56–0.58). In regression models, very active minutes explain a meaningful share of variation in calories (R² ≈ 0.30 in the first window and ≈ 0.38 in the second), with a consistent positive slope (roughly 13–14 additional calories per extra very active minute).
+
+By contrast, calories have only weak-to-moderate relationships with lightly active minutes (correlations ~0.19–0.24) and fairly active minutes (correlations ~0.07–0.28), and these models explain substantially less variance (generally under ~0.12 R²). Sedentary minutes show a small negative association with calories in both windows (correlations around −0.12 to −0.17) with very low explanatory power, indicating sedentary time alone is not a strong driver of calorie variation.
+
+Overall, these results suggest that calorie expenditure is most closely tied to higher-intensity activity, while light activity and sedentary time are much weaker predictors.
+
+# Sleep and Weight Logging Behavior
+## Sleep Logging Adoption
+
+This section summarizes sleep logging behavior across time periods, focusing on both the frequency of sleep logs and user participation.
+
+```{r}
+users %>%
+  filter(sleep_rows > 0) %>%
+  group_by(dataset_window, Id) %>%
+  summarise(
+    pct_sleep_logs_per_period = sleep_rows/31,
+    pct_sleep_logs_per_active_days = sleep_rows/days_with_activity,
+    .groups = "drop"
+  )
+daily %>%
+  filter(dataset_window == "2016-04-12_to_2016-05-12") %>%
+  group_by(log_date) %>%
+  summarise(
+    n_users = n(),
+    n_sleep_logs = sum(has_sleep_log_for_day, na.rm = TRUE),
+    pct_users = n_sleep_logs/sum(n_users),
+    .groups = "drop"
+  ) %>%
+  arrange(log_date)
+```
+
+**Interpretation notes:**
+Sleep logging behavior in the second observation window (2016-04-12 to 2016-05-12) shows substantial variation across users, alongside moderate but stable day-level adoption.
+
+At the user level, sleep logging consistency ranges from very low to near-complete coverage. Several users log sleep on fewer than 10–15% of days, while others log sleep on over 90%, and in some cases 100%, of days in the period. For most users, the proportion of sleep logs relative to total days closely matches the proportion relative to active days, indicating that sleep logging tends to occur consistently on days when users are active, rather than sporadically.
+
+At the daily level, sleep logging adoption is relatively stable across the observation window. On most days, approximately 40–50% of active users record sleep data. Adoption fluctuates modestly over time, with occasional peaks above 50%, but no sustained upward or downward trend is observed. Toward the end of the window, the number of active users declines, but the proportion logging sleep remains broadly consistent.
+
+Taken together, these results indicate that sleep tracking is a habitual behavior for a subset of users, rather than a feature that is uniformly adopted across the population. Sleep logging appears to be driven by individual-level engagement patterns rather than by date-specific or short-term effects, reinforcing the importance of user segmentation when interpreting sleep-related metrics.
+
+## Calories vs Time in Bed
+
+To assess whether time in bed quantity alone meaningfully relates to energy output, sleep duration (measured as time spent in bed) is examined next.
+
+```{r}
+cor_by_window <- daily %>%
+  filter(dataset_window == "2016-04-12_to_2016-05-12") %>%
+  summarise(
+    cor_in_bed_calories = cor(time_in_bed, calories, use = "complete.obs"),
+    n_days = n(),
+    .groups = "drop"
+  )
+
+cor_by_window
+
+lm_in_bed_cal <- lm(calories ~ time_in_bed, data = daily)
+summary(lm_in_bed_cal)
+
+ggplot(daily, aes(x = time_in_bed, y = calories)) +
+  geom_point(alpha = 0.25, size = 1) +
+  geom_smooth(method = "lm", se = FALSE, color = "purple", linewidth = 1) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Minutes in Bed vs Calories Burned",
+    subtitle = "Each point represents one user-day",
+    x = "Total Minutes in Bed",
+    y = "Calories Burned"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+**Interpretation notes:**
+Time spent in bed shows a weak negative relationship with calories burned. The correlation between time in bed and daily calories is −0.13, indicating a very small inverse association. The linear model confirms this pattern, with time in bed explaining less than 2% of the variance in calories burned (R² ≈ 0.02).
+
+While the estimated slope is statistically significant, its magnitude is small: each additional minute spent in bed is associated with a decrease of less than 1 calorie, suggesting minimal practical impact. The low explanatory power of the model and substantial residual variation indicate that sleep duration alone is not a meaningful predictor of daily calorie expenditure.
+
+Overall, these results suggest that calories burned are driven primarily by activity-related factors, rather than by sleep quantity, reinforcing the importance of movement intensity and duration over passive time measures.
+
+## Weight Logging Behavior
+
+Weight logging behavior was analyzed separately due to its sparse and irregular nature.
+
+```{r}
+users %>%
+  filter(weight_rows > 0) %>%
+  group_by(dataset_window, Id) %>%
+  summarise(
+    pct_weight_logs_per_period = weight_rows/31,
+    pct_weight_logs_per_active_days = weight_rows/days_with_activity,
+    .groups = "drop"
+  )
+daily %>%
+  group_by(dataset_window, log_date) %>%
+  summarise(
+    n_users = n(),
+    n_weight_logs = sum(has_weight_log_for_day, na.rm = TRUE),
+    pct_users = n_weight_logs/sum(n_users),
+    .groups = "drop"
+  ) %>%
+  arrange(log_date)
+```
+
+**Interpretation notes:**
+Weight logging is sparse and highly concentrated among a small subset of users across both observation windows.
+
+At the user level, most users log weight on only a very small fraction of days, often below 5–10%. A few users stand out as consistent weight loggers, recording weight on a majority of days and, in some cases, on nearly all active days. This results in a highly skewed distribution, where a small number of users account for a disproportionate share of weight records. For users who do log weight, the proportion of weight logs relative to total days is generally similar to the proportion relative to active days, indicating that weight logging tends to occur on days when users are otherwise engaged.
+
+At the daily level, weight logging adoption is extremely low. On most days, fewer than 10% of active users record a weight measurement, and many days show no weight logs at all, particularly in the earlier part of the first observation window. While the second window exhibits slightly more regular logging, daily adoption remains consistently low, rarely exceeding 10–15% of users even on peak days.
+
+Taken together, these results indicate that weight tracking is a non-core feature for the majority of users and functions as a niche or intentional behavior rather than a habitual daily practice. As a result, weight-related metrics are best interpreted as reflective of a highly engaged subset of users rather than representative of overall population behavior.
+
+# Relationships Between Activity, Calories, and Weight
+## Activity vs Calories
+
+This section explores the relationship between physical activity metrics and average daily calorie expenditure.
+
+```{r}
+cor_by_window <- daily %>%
+  group_by(dataset_window) %>%
+  summarise(
+    cor_steps_calories = cor(total_steps, calories, use = "complete.obs"),
+    n_days = n(),
+    .groups = "drop"
+  )
+
+cor_by_window
+
+lm_by_window <- daily %>%
+  group_by(dataset_window) %>%
+  do(model = lm(calories ~ total_steps, data = .))
+
+print(summary(lm_by_window$model[[1]]), digits = 4)
+print(summary(lm_by_window$model[[2]]), digits = 4)
+
+ggplot(daily, aes(x = total_steps, y = calories)) +
+  geom_point(alpha = 0.25, size = 1) +
+  geom_smooth(method = "lm", se = FALSE, color = "purple", linewidth = 1) +
+  facet_wrap(~ dataset_window) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Daily Steps vs Calories Burned",
+    subtitle = "Each point represents one user-day",
+    x = "Total Daily Steps",
+    y = "Calories Burned"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+**Interpretation notes:**
+Daily step count shows a moderate positive association with calories burned in both observation windows. The correlation between steps and calories is 0.56 in the first window (2016-03-12 to 2016-04-11) and increases slightly to 0.59 in the second window (2016-04-12 to 2016-05-12), indicating a consistent relationship across time.
+
+Linear regression results reinforce this pattern. In the first window, daily steps explain approximately 31% of the variance in calories burned (R² = 0.31), while in the second window, explanatory power increases to 35% (R² = 0.35). In both models, the relationship between steps and calories is statistically significant (p < 0.001).
+
+The estimated slope coefficients suggest that each additional step is associated with an increase of approximately 0.08 calories, highlighting that step count is a meaningful—but incomplete—proxy for daily energy expenditure. The substantial unexplained variance indicates that factors beyond step volume, such as activity intensity and individual metabolic differences, also play an important role in determining total calories burned.
+
+## Weight vs Activity and Calories
+
+```{r}
+cor_by_window <- daily %>%
+  filter(weight_kg>40) %>%
+  group_by(dataset_window) %>%
+  summarise(
+    cor_weight_calories = cor(weight_kg, calories, use = "complete.obs"),
+    n_days = n(),
+    .groups = "drop"
+  )
+
+cor_by_window
+
+lm_by_window <- daily %>%
+  group_by(dataset_window) %>%
+  do(model = lm(calories ~ weight_kg, data = .))
+
+print(summary(lm_by_window$model[[1]]), digits = 4)
+print(summary(lm_by_window$model[[2]]), digits = 4)
+
+ggplot(daily, aes(x = weight_kg, y = calories)) +
+  geom_point(alpha = 0.25, size = 1) +
+  geom_smooth(method = "lm", se = FALSE, color = "purple", linewidth = 1) +
+  facet_wrap(~ dataset_window) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Weight vs Calories Burned",
+    subtitle = "Each point represents one user-day",
+    x = "Weight (kg)",
+    y = "Calories Burned"
+  ) +
+  theme_minimal(base_size = 13)
+
+cor_by_window <- daily %>%
+  filter(weight_kg>40) %>%
+  group_by(dataset_window) %>%
+  summarise(
+    cor_weight_steps = cor(weight_kg, total_steps, use = "complete.obs"),
+    n_days = n(),
+    .groups = "drop"
+  )
+
+cor_by_window
+
+lm_by_window <- daily %>%
+  group_by(dataset_window) %>%
+  do(model = lm(total_steps ~ weight_kg, data = .))
+
+print(summary(lm_by_window$model[[1]]), digits = 4)
+print(summary(lm_by_window$model[[2]]), digits = 4)
+
+ggplot(daily, aes(x = weight_kg, y = total_steps)) +
+  geom_point(alpha = 0.25, size = 1) +
+  geom_smooth(method = "lm", se = FALSE, color = "purple", linewidth = 1) +
+  facet_wrap(~ dataset_window) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Weight vs Total Steps",
+    subtitle = "Each point represents one user-day",
+    x = "Weight (kg)",
+    y = "Total Steps"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+**Interpretation notes:**
+Weight-related analyses are based on a small subset of days with weight logs (31 days in the first window; 67 days in the second), so results should be interpreted as descriptive rather than representative of the full population.
+
+Across both windows, weight shows a positive association with calories burned, stronger in the second window. Correlations are 0.43 (Window 1) and 0.66 (Window 2). The linear models are consistent with this: weight explains ~19% of calorie variation in the first window (R² ≈ 0.19) and ~44% in the second window (R² ≈ 0.44), with a positive slope in both cases. This likely reflects that higher body mass tends to increase energy expenditure estimates for comparable activity levels.
+
+The relationship between weight and steps is weaker and less stable. In the first window, the correlation is slightly negative (−0.19) and the regression is not statistically meaningful (very low R² ≈ 0.04; p ≈ 0.30). In the second window, the association turns modestly positive (correlation 0.29) with a small but statistically detectable effect (R² ≈ 0.08). Overall, weight is not a strong predictor of step volume in this sample.
+
+Taken together, these results suggest that weight is more closely tied to estimated calorie expenditure than to daily step counts, but the sparsity and selectivity of weight logging means conclusions should remain cautious and framed as patterns within a highly engaged subset of users.
+
+# Engagement and Retention Trends
+## Daily Logging Participation
+
+This section focuses on how many users log data on a given day, providing insight into engagement and retention over time.
+
+```{r}
+unique_users <- daily %>%
+  group_by(log_date) %>%
+  summarize(distinct_users = n_distinct(Id), .groups = "drop")
+
+unique_users
+
+ggplot(unique_users, aes(x = log_date, y = distinct_users)) +
+  geom_line() +
+  scale_x_continuous(labels = scales::comma) +
+  labs(
+    title = "Distinct Users per Day",
+    x = "Log Date",
+    y = "Total Logs"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+**Interpretation notes:**
+User participation increases sharply early in the observation period and stabilizes before gradually declining toward the end. This pattern is consistent with typical engagement decay seen in consumer health tracking applications.
+
+## Cross-Feature Engagement
+
+```{r}
+user_overlap <- users %>%
+  mutate(
+    engagement_group = case_when(
+      has_sleep_log & has_weight_log ~ "Activity + Sleep + Weight",
+      has_sleep_log & !has_weight_log ~ "Activity + Sleep",
+      !has_sleep_log & has_weight_log ~ "Activity + Weight",
+      TRUE ~ "Activity only"
+    )
+  )
+
+overlap_summary <- user_overlap %>%
+  group_by(dataset_window, engagement_group) %>%
+  summarise(
+    n_users = n(),
+    .groups = "drop"
+  ) %>%
+  group_by(dataset_window) %>%
+  mutate(
+    pct_users = n_users / sum(n_users)
+  )
+
+overlap_summary
+
+ggplot(overlap_summary,
+       aes(x = dataset_window, y = pct_users, fill = engagement_group)) +
+  geom_col() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "User Engagement Overlap by Observation Window",
+    x = NULL,
+    y = "% of users",
+    fill = "Engagement type"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+**Interpretation notes:**
+User engagement differs substantially across the two observation windows, both in feature adoption and depth of tracking.
+
+In the first observation window (2016-03-12 to 2016-04-11), engagement is limited almost entirely to activity tracking. Approximately 69% of users log only activity, while the remaining 31% log activity in combination with weight. Sleep tracking is entirely absent during this period, indicating either limited feature usage or incomplete data availability. Weight logging, while present, is restricted to a minority of users and does not represent a core behavior.
+
+In the second observation window (2016-04-12 to 2016-05-12), engagement becomes more diversified. A majority of users (~55%) log both activity and sleep, and an additional 18% log activity, sleep, and weight together. Activity-only users decline to just over 21%, while activity-plus-weight users remain rare (~6%). This shift highlights a clear increase in sleep feature adoption, while weight tracking continues to be used by a small, highly engaged subset.
+
+Overall, activity tracking serves as the foundational behavior across all users, sleep tracking emerges as a meaningful secondary feature for engaged users, and weight tracking remains niche and selective.
+
+## Tracker Distance vs Total Distance
+
+```{r}
+cor_dist <- daily %>%
+  summarise(
+    cor_total_tracker = cor(total_distance, tracker_distance, use = "complete.obs")
+  )
+
+cor_dist
+
+daily_leaf <- daily %>%
+  mutate(
+    distance_diff = total_distance - tracker_distance
+  )
+
+summary(daily_leaf$distance_diff)
+
+ggplot(daily,
+       aes(x = tracker_distance, y = total_distance)) +
+  geom_point(alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = "Tracker Distance vs Total Distance",
+    x = "Tracker Distance",
+    y = "Total Distance"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation notes:**
+Tracker distance and total distance are nearly identical across the dataset. The correlation between the two measures is extremely high (r ≈ 0.998), indicating near-perfect alignment.
+
+The distribution of differences further confirms this finding: for the vast majority of records, the difference between total distance and tracker distance is exactly zero, with a median of 0.0 and minimal variation. Occasional positive deviations exist, but they are infrequent and small relative to overall distance values.
+
+These results suggest that total distance is overwhelmingly derived from tracker-recorded movement, with negligible contribution from non-tracker sources. As a result, tracker distance alone is sufficient for distance-based analyses without material loss of information.
+
+# Overall Conclusions and Recommendations
+
+This analysis examined user activity, sleep, and logging behavior across two time periods using both SQL-based data marts, Tableau dashboards, and statistical summaries in R.
+
+## Key Conclusions
+
+1. Activity tracking is the core and universal behavior: All users engage with activity tracking, making it the primary and most reliable signal of engagement. Other features build on top of this foundation rather than replacing it.
+
+2. Sleep tracking shows strong adoption among engaged users: Once available, sleep tracking is adopted by a majority of users and is used consistently by those who adopt it. Sleep logging appears to be a habitual behavior rather than a sporadic one.
+
+3. Weight tracking is a niche, high-intent feature: Weight logging is rare, highly concentrated, and used primarily by a small subset of users. It should not be treated as a baseline behavior or population-wide metric.
+
+4. Calories are driven by activity intensity, not just volume: Higher-intensity activity (very active minutes) explains substantially more variation in calories than steps or light activity alone. Sedentary time and sleep duration show weak or negligible relationships with calorie expenditure.
+
+5. Tracker data is highly reliable and internally consistent: The near-perfect alignment between tracker distance and total distance supports confidence in the device’s core movement measurements.
+
+6. Weekday vs. weekend patterns are subtle, with gradual declines beginning midweek and slightly lower activity on weekends rather than abrupt changes.
+
+7. User behavior varies more by engagement segment than by calendar timing, highlighting the importance of user-level segmentation.
+
+## Business Recommendations for Bellabeat Leaf
+1. Anchor the product experience around activity-first engagement
+
+Treat activity tracking as the default entry point for all users.
+
+Design onboarding and dashboards to emphasize daily movement trends before introducing secondary features.
+
+2. Position sleep tracking as the primary engagement deepener
+
+Promote sleep tracking once users demonstrate consistent activity logging.
+
+Use nudges that connect sleep quality to activity consistency, rather than to calorie outcomes, since sleep duration alone does not meaningfully predict calories.
+
+3. Reframe weight tracking as an optional, goal-driven tool
+
+Avoid positioning weight logging as a daily expectation.
+
+Instead, market it toward users with specific goals (e.g., weight management or long-term progress tracking), acknowledging its intentional and infrequent use.
+
+4. Emphasize activity intensity over step count alone
+
+Highlight very active minutes and intensity-based insights in the Leaf app.
+
+Introduce prompts or feedback that encourage short bursts of higher-intensity movement, which have a clearer relationship with calorie expenditure than additional low-intensity steps.
+
+5. Simplify distance-based reporting using tracker distance
+
+Use tracker distance as the primary distance metric in dashboards and analyses.
+
+This reduces complexity while maintaining accuracy, improving clarity for both users and internal analytics.
+
+6. Segment Users by Engagement Patterns
+
+User behavior varies significantly across engagement groups (low engagement, irregular movers, consistent movers). Treating all users the same obscures meaningful differences.
+
+Adopt engagement-based segmentation in analytics and product design:
+
+- Low engagement: simplify goals, reduce friction
+- Irregular movers: emphasize consistency streaks
+- Consistent movers: introduce advanced insights (sleep efficiency, intensity optimization)
+
