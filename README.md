@@ -19,6 +19,13 @@ sustainable wellness habits among users?
 - Analysis validated in R
 - Visualized in Tableau Public
 
+## Analysis Report (R Markdown)
+
+The full analytical workflow, data validation, and statistical summaries are documented in an R Markdown report.
+Due to file size limitations, the rendered HTML is hosted via GitHub Pages rather than previewed directly in the repository.
+
+📄 View the [report](https://https://lreva.github.io/Bellabeat-Leaf-Case-Study/)
+
 # Tableau Dashboards (Interactive)
 
 The Tableau workbook is structured as a **question-driven analysis** rather than a linear presentation.
