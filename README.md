@@ -24,7 +24,7 @@ sustainable wellness habits among users?
 The full analytical workflow, data validation, and statistical summaries are documented in an R Markdown report.
 Due to file size limitations, the rendered HTML is hosted via GitHub Pages rather than previewed directly in the repository.
 
-📄 View the [report](https://https://lreva.github.io/Bellabeat-Leaf-Case-Study/)
+📄 View the [report](https://lreva.github.io/Bellabeat-Leaf-Case-Study/)
 
 # Tableau Dashboards (Interactive)
 
